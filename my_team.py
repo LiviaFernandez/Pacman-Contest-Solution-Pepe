@@ -9,18 +9,18 @@
 import os
 import random
 
-import contest.distance_calculator as distance_calculator
 import contest.util as util
 from contest.capture_agents import CaptureAgent
 from contest.game import Directions
 
-SIGHT = 5            # rules: we only see rivals at <= 5 (manhattan)
-MIN_FOOD = 2         # game is over when all food but 2 is eaten
-UNSEEN_SLACK = 3     #extra margin for ghosts we dont see (our guess can be wrong)
-BIG = 10 ** 6        # infinity
+MIN_FOOD = 2        # game is over when all food but 2 is eaten
+CARRY_LIMIT = 5     # with this much food we go back home
+DANGER_DIST = 5     # a ghost this close -> we think with alpha-beta
+DEPTH = 2           # how deep alpha-beta looks
+INF = 999999
 _DEBUG = os.environ.get('PACMAN_DEBUG') == '1'   # only for local tests
 
-# Actions are just N S E W
+# Actions are just N S E W 
 DIRS = {Directions.NORTH: (0, 1), Directions.SOUTH: (0, -1),
         Directions.EAST: (1, 0), Directions.WEST: (-1, 0)}
 
@@ -34,509 +34,294 @@ def create_team(first_index, second_index, is_red,
     return [eval(first)(first_index), eval(second)(second_index)]
 
 
-# shared memory of our 2 agents
-class TeamInfo:
-    def __init__(self):
-        self.registered = set()       
-        self.beliefs = {}                
-        self.last_food = None          
-        self.last_eaten = None           # (cell, turn) where they ate our food
-        self.targets = {}                # agent -> food it goes for (so they dont go to the same)
-        self.turn = 0
-        self.last_invader_turn = 0       # last turn a rival was on our side
-
-
-_TEAMS = {} 
-
-
 ##########
 # Agents #
 ##########
 
 class BaseAgent(CaptureAgent):
 
-    # runs once at the start 
+    # runs once at the start
     def register_initial_state(self, gs):
         CaptureAgent.register_initial_state(self, gs)   # gives self.red and get_maze_distance
-
-        team = _TEAMS.get(self.red)
-        if team is None or self.index in team.registered:
-            team = _TEAMS[self.red] = TeamInfo()
-        team.registered.add(self.index)
-        self.team = team
-
         self.start = gs.get_agent_position(self.index)
         self.walls = gs.get_walls()
-        self.cells = self.walls.as_list(False)   #open cells
-        self.mid = self.walls.width / 2.0        # middle line, red is x < mid
-        self.opponents = self.get_opponents(gs)
-        self.mate = [i for i in self.get_team(gs) if i != self.index][0]
-        for o in self.opponents:
-            team.beliefs.setdefault(o, util.Counter({gs.get_initial_agent_position(o): 1.0}))
-        self.total_food = len(self.get_food(gs).as_list())
-        self.stuck = 0     # turns the attacker had nothing safe to eat
+        self.mid = self.walls.width / 2.0               # middle line, red is x < mid
 
-        self.study_map(gs)
+        # border = our last column, only the cells where we can cross to the other side
+        if self.red:
+            bx = (self.walls.width - 1) // 2
+            ox = bx + 1
+        else:
+            bx = (self.walls.width + 1) // 2
+            ox = bx - 1
+        self.border = []
+        for y in range(self.walls.height):
+            if not self.walls[bx][y] and not self.walls[ox][y]:
+                self.border.append((bx, y))
 
-    # helper function: studies the map at the start and saves what we need
-    def study_map(self, gs):
-        w = self.walls
+    def on_my_side(self, cell):
+        if self.red:
+            return cell[0] < self.mid
+        else:
+            return cell[0] >= self.mid
 
-        # border = our last column, only where we can cross to the other side
-        bx = (w.width - 1) // 2 if self.red else (w.width + 1) // 2
-        ox = bx + 1 if self.red else bx - 1
-        self.border = [(bx, y) for y in range(w.height) if not w[bx][y] and not w[ox][y]]
+    def actions(self, cell):
+        # Actions(s): moves that dont hit a wall
+        moves = []
+        for a in DIRS:
+            dx, dy = DIRS[a]
+            if not self.walls[cell[0] + dx][cell[1] + dy]:
+                moves.append(a)
+        return moves
 
-        # distances inside our camp (defender doesn't leave): copy of the map with the rival side as wall
-        home_layout = gs.data.layout.deep_copy()
-        for x in range(w.width):
-            if (x < self.mid) != self.red:
-                for y in range(w.height):
-                    home_layout.walls[x][y] = True
-        self.home_distancer = distance_calculator.Distancer(home_layout)
-        self.home_distancer.get_maze_distances()
+    def result(self, cell, a):
+        # Result(s, a): the cell where we end
+        dx, dy = DIRS[a]
+        return (cell[0] + dx, cell[1] + dy)
 
-        # dead ends: keep removing cells with 0 or 1 free neighbour until nothing changes
-        dead = set()
-        changed = True
-        while changed:
-            changed = False
-            for c in self.cells:
-                if c not in dead and len([n for n in self.neighbors(c) if n not in dead]) <= 1:
-                    dead.add(c)
-                    changed = True
+    def bfs(self, start, goals, stay_home=False):
 
-        #for each dead end cell: exit = closest normal cell, depth = steps to it
-        alive = [c for c in self.cells if c not in dead]
-        self.exit, self.depth = {}, {}
-        for c in self.cells:
-            if c in dead and alive:
-                self.exit[c] = min(alive, key=lambda a: self.get_maze_distance(c, a))
-                self.depth[c] = self.get_maze_distance(c, self.exit[c])
-            else:
-                self.exit[c], self.depth[c] = c, 0
+        frontier = util.Queue()
+        frontier.push((start, None))      # (cell, first action we did to get there)
+        reached = set()
+        reached.add(start)
+        while not frontier.is_empty():
+            cell, first_action = frontier.pop()
+            if cell in goals:   # goal test
+                return first_action
+            for a in self.actions(cell):
+                nxt = self.result(cell, a)
+                if nxt in reached:
+                    continue
+                if stay_home and not self.on_my_side(nxt):
+                    continue
+                reached.add(nxt)
+                if first_action is None:
+                    frontier.push((nxt, a))
+                else:
+                    frontier.push((nxt, first_action))
+        return None
 
+    def home_distance(self, cell):
+        best = INF
+        for b in self.border:
+            d = self.get_maze_distance(cell, b)
+            if d < best:
+                best = d
+        return best
 
-    def actions(self, c):
-        return [a for a, (dx, dy) in DIRS.items() if not self.walls[c[0] + dx][c[1] + dy]]
-
-    def result(self, c, a):
-        dx, dy = DIRS.get(a, (0, 0))    # STOP -> same cell
-        return (c[0] + dx, c[1] + dy)
-
-    def neighbors(self, c):
-        return [self.result(c, a) for a in self.actions(c)]
-
-    def on_my_side(self, c):
-        return (c[0] < self.mid) == self.red
-
-    def home_distance(self, c):
-        return min(self.get_maze_distance(c, b) for b in self.border)
-
-    def hdist(self, a, b):
-        # distance without leaving our side (if there is no path, normal one + 50)
-        if self.on_my_side(a) and self.on_my_side(b):
-            d = self.home_distancer.get_distance(a, b)
-            if d < BIG:
-                return d
-        return self.get_maze_distance(a, b) + 50
+    def visible_rivals(self, gs, pacman):
+        # rivals we can see. pacman=True -> the ones in our side, False -> ghosts in their side
+        rivals = []
+        for o in self.get_opponents(gs):
+            pos = gs.get_agent_position(o)
+            if pos is not None and gs.get_agent_state(o).is_pacman == pacman:
+                rivals.append(o)
+        return rivals
 
     def choose_action(self, gs):
-        #rational agent: look at the world, update beliefs, then decide
         legal = gs.get_legal_actions(self.index)
         try:
-            self.update_beliefs(gs)
             action = self.decide(gs)
         except Exception:
             if _DEBUG:
                 raise
             action = None
-        if action not in legal:   # something went wrong -> random move so we dont lose the game
-            action = random.choice([a for a in legal if a != Directions.STOP] or legal)
+        if action not in legal:    # something went wrong -> random move so we dont lose the game
+            action = random.choice(legal)
         return action
 
     def decide(self, gs):
         raise NotImplementedError
 
-    # where can the rivals we dont see be?
-    def update_beliefs(self, gs):
-        t = self.team
-        t.turn += 1
-        me = gs.get_agent_position(self.index)
-        mate = gs.get_agent_position(self.mate)
-        noisy = gs.get_agent_distances()
-        mover = (self.index - 1) % 4    # the rival that moved just before us
-
-        # 1. he moved: stays or goes to a neighbour, all the same probability 
-        new = util.Counter()
-        for c, p in t.beliefs[mover].items():
-            options = [c] + self.neighbors(c)
-            for n in options:
-                new[n] += p / len(options)
-        t.beliefs[mover] = new
-
-        # 2. if some of our food is gone, he is there
-        food = set(self.get_food_you_are_defending(gs).as_list())
-        if t.last_food is not None and t.last_food - food:
-            spot = (t.last_food - food).pop()
-            t.last_eaten = (spot, t.turn)
-            t.beliefs[mover] = util.Counter({spot: 1.0})
-        t.last_food = food
-
-        # 3. keep only cells that agree with what we see
-        for o in self.opponents:
-            pos = gs.get_agent_position(o)
-            pacman = gs.get_agent_state(o).is_pacman
-            if pacman:
-                t.last_invader_turn = t.turn
-            if pos is not None:      # we see him, easy
-                t.beliefs[o] = util.Counter({pos: 1.0})
-                continue
-
-            def fits(c):
-                d = util.manhattan_distance(c, me)
-                return (self.on_my_side(c) == pacman            # pacman = he is on our side
-                        and d > SIGHT and util.manhattan_distance(c, mate) > SIGHT   # else we would see him
-                        and gs.get_distance_prob(d, noisy[o]) > 0)          
-            
-            b = util.Counter({c: p for c, p in t.beliefs[o].items() if fits(c)})
-            if b.total_count() == 0:
-                # lost him, most times he died -> try near his start, then anywhere
-                b = util.Counter({c: 1.0 for c in self.cells
-                                  if fits(c) and self.get_maze_distance(c, gs.get_initial_agent_position(o)) <= 4})
-            if b.total_count() == 0:
-                b = util.Counter({c: 1.0 for c in self.cells if fits(c)})
-            if b.total_count() == 0:
-                b = util.Counter({gs.get_initial_agent_position(o): 1.0})
-            b.normalize()
-            t.beliefs[o] = b
-
-    def estimate(self, gs, o):
-        pos = gs.get_agent_position(o)
-        if pos is not None:
-            return pos, True
-        return self.team.beliefs[o].arg_max(), False
-
-    def ghosts(self, gs):
-        # rivals on their side: (pos, scared timer, seen)
-        res = []
-        for o in self.opponents:
-            st = gs.get_agent_state(o)
-            if not st.is_pacman:
-                pos, seen = self.estimate(gs, o)
-                res.append((pos, st.scared_timer, seen))
-        return res
-
-    def invaders(self, gs):
-        # rivals on our side: (index, pos, seen)
-        return [(o,) + self.estimate(gs, o) for o in self.opponents if gs.get_agent_state(o).is_pacman]
-
-
-    def step_towards(self, gs, target, stay_home=False, keep=None):
-        """greedy (lecture 4): one step to the neighbour with the smallest h = maze distance
-        keep=k -> try to stay at distance k (when we are scared)"""
-        me = gs.get_agent_position(self.index)
-        best, best_h = [], BIG
-        for a in gs.get_legal_actions(self.index):
-            n = self.result(me, a)
-            if stay_home and not self.on_my_side(n):
-                continue
-            h = self.hdist(n, target) if stay_home else self.get_maze_distance(n, target)
-            if keep is not None:
-                h = abs(h - keep) * 10 + (1000 if h < keep else 0)
-            if a == Directions.STOP:
-                h += 0.5      #moving is better than waiting
-            if h < best_h:
-                best, best_h = [a], h
-            elif h == best_h:
-                best.append(a)
-        return random.choice(best) if best else None
-
-    def chase(self, gs, inv_pos, inv_carry):
-        """defend vs an invader without crossing"""
-        me = gs.get_agent_position(self.index)
-        if gs.get_agent_state(self.index).scared_timer > 0:
-            return self.step_towards(gs, inv_pos, stay_home=True, keep=2)   # he can eat us, follow from 2
-        if self.hdist(me, inv_pos) <= 2:
-            return self.step_towards(gs, inv_pos, stay_home=True)            # close -> go for him
-
-        # far: we cant catch him running (same speed) so we stand where he has
-        # less "safe" food (food he reaches 2+ steps before us), capsules and exits
-        food = [(f, self.get_maze_distance(inv_pos, f)) for f in self.get_food_you_are_defending(gs).as_list()]
-        caps = [(c, self.get_maze_distance(inv_pos, c)) for c in self.get_capsules_you_are_defending(gs)]
-        exits = [(b, self.get_maze_distance(inv_pos, b)) for b in self.border]
-        best, best_score = [], BIG
-        for a in gs.get_legal_actions(self.index):
-            n = self.result(me, a)
-            if not self.on_my_side(n):
-                continue
-            score = (3 * sum(1 for f, d in food if self.hdist(n, f) - d >= 2)
-                     + 8 * sum(1 for c, d in caps if self.hdist(n, c) - d >= 1)
-                     + 0.6 * self.hdist(n, inv_pos))
-            if inv_carry > 0:   # with food he wants to go home -> block exits
-                score += (0.5 + 0.3 * min(inv_carry, 10)) * sum(1 for b, d in exits if self.hdist(n, b) - d >= 1)
-            if a == Directions.STOP:
-                score += 0.3
-            if score < best_score - 1e-9:
-                best, best_score = [a], score
-            elif abs(score - best_score) <= 1e-9:
-                best.append(a)
-        return random.choice(best) if best else self.step_towards(gs, inv_pos, stay_home=True)
-
-    def defend(self, gs, invaders):
-        # first the ones we see, then the one with more food, then the closest
-        me = gs.get_agent_position(self.index)
-        o, pos, seen = min(invaders, key=lambda x: (not x[2], -gs.get_agent_state(x[0]).num_carrying,
-                                                    self.hdist(me, x[1])))
-        return self.chase(gs, pos, gs.get_agent_state(o).num_carrying)
-
 
 class OffensiveAgent(BaseAgent):
-    #goes to eat their food, planning safe paths
+    # goes to eat their food
 
     def decide(self, gs):
         me = gs.get_agent_position(self.index)
-        st = gs.get_agent_state(self.index)
-        # help the defender: if an invader is close to us, or he is taking a lot of our food
-        if st.scared_timer == 0 and st.num_carrying <= 2:
-            mate = gs.get_agent_position(self.mate)
-            for o, pos, seen in self.invaders(gs):
-                carry = gs.get_agent_state(o).num_carrying
-                d, d_mate = self.get_maze_distance(me, pos), self.get_maze_distance(mate, pos)
-                close = not st.is_pacman and d <= 6 and (carry >= 1 or d_mate > 5)
-                big_threat = carry >= 4 and d <= 14 and d_mate > 2
-                if close or big_threat:
-                    if st.is_pacman:
-                        return self.attack(gs, go_home=True)   # first come back
-                    return self.chase(gs, pos, carry)
-        return self.attack(gs)
-
-    # danger[c] = first move a ghost (not scared) could be in cell c
-    def danger_map(self, gs):
-        danger = {c: BIG for c in self.cells}
-        for pos, scared, seen in self.ghosts(gs):
-            extra = 0 if seen else UNSEEN_SLACK
-            for c in self.cells:
-                danger[c] = min(danger[c], max(self.get_maze_distance(pos, c), scared) + extra)
-        return danger
-
-    def safe_search(self, start, danger, risk=0):
-        found = {start: (0, None)}     # expanded + frontier, so no cell twice
-        frontier = util.Queue()
-        frontier.push(start)
-        while not frontier.is_empty():
-            c = frontier.pop()
-            moves, first = found[c]
-            for a in self.actions(c):
-                n = self.result(c, a)
-                if n in found:
-                    continue
-                if not self.on_my_side(n) and danger[n] <= moves + 1 - risk:
-                    continue    # ghost could be there first
-                found[n] = (moves + 1, first or a)
-                frontier.push(n)
-        return found
-
-    def margin(self, f, moves, danger, caps):
-        if self.depth[f] > 0:
-            m = danger[self.exit[f]] - (moves + self.depth[f])
-        else:
-            m = danger[f] - moves
-        if m < 3:   # a capsule close by is also a way out
-            for c in caps:
-                m = max(m, danger[c] - (moves + self.get_maze_distance(f, c)))
-        return m
-
-    def attack(self, gs, go_home=False):
-        me = gs.get_agent_position(self.index)
-        st = gs.get_agent_state(self.index)
-        carrying = st.num_carrying
+        my_state = gs.get_agent_state(self.index)
+        carrying = my_state.num_carrying
         food = self.get_food(gs).as_list()
-        caps = self.get_capsules(gs)
         moves_left = gs.data.timeleft // 4
-        ghosts = self.ghosts(gs)
-        active = [g for g in ghosts if g[1] <= 3]                     # not scared (or almost)
-        near = min([self.get_maze_distance(me, p) for p, s, seen in active if seen] or [BIG])
 
-        danger = self.danger_map(gs)
-        risk = min(3, 1 + (self.stuck - 20) // 10) if self.stuck >= 20 and carrying == 0 else 0
-        plan = self.safe_search(me, danger, risk)
+        # closest ghost we see that can eat us (not scared)
+        ghost = None
+        ghost_dist = INF
+        for o in self.visible_rivals(gs, pacman=False):
+            if gs.get_agent_state(o).scared_timer <= 2:
+                d = self.get_maze_distance(me, gs.get_agent_position(o))
+                if d < ghost_dist:
+                    ghost = o
+                    ghost_dist = d
+
+        # ghost close and we are in their side -> adversarial search 
+        if my_state.is_pacman and ghost is not None and ghost_dist <= DANGER_DIST:
+            return self.alpha_beta(gs, ghost)
 
         # time to go home?
-        returned = sum(gs.get_agent_state(i).num_returned for i in self.get_team(gs))
-        if carrying > 0 and (len(food) <= MIN_FOOD
-                             or returned + carrying >= self.total_food - MIN_FOOD   # enough to win
-                             or moves_left <= self.home_distance(me) + 6            # game ending
-                             or (near <= 4 and carrying >= 2)
-                             or carrying >= self.carry_limit(gs, near, len(active))):
+        go_home = False
+        if carrying >= CARRY_LIMIT:
+            go_home = True
+        if carrying > 0 and len(food) <= MIN_FOOD:
+            go_home = True
+        if carrying > 0 and moves_left < self.home_distance(me) + 5:     # game is ending
             go_home = True
 
-        target, m = (None, 0) if go_home else self.pick_food(gs, food, plan, danger, caps, carrying, active)
-        if not go_home:
-            if active and near <= 6:     # ghost close -> capsule is great (if not much further than the food)
-                for c in caps:
-                    if c in plan and (target is None or plan[c][0] < plan[target][0] + 4):
-                        target, m = c, BIG
-            for p, s, seen in ghosts:    # scared ghost right next to us -> eat it
-                if seen and s > 2 and p in plan and plan[p][0] <= 2 and plan[p][0] < s:
-                    target, m = p, BIG
+        if go_home:
+            action = self.bfs(me, self.border)
+        else:
+            action = self.bfs(me, food)        # closest food
+        if action is None:
+            return Directions.STOP
+        return action
 
-        # stuck counter (used to take more risk)
-        if target is None and not go_home and not st.is_pacman:
-            self.stuck += 1
-        elif target is None or go_home or m >= 2 + min(carrying, 6) // 3:
-            self.stuck = 0
+    #  alpha-beta, MAX = us, MIN = the ghost
 
-        if target is not None:
-            self.team.targets[self.index] = target
-            return plan[target][1]
-        self.team.targets.pop(self.index, None)
-        if go_home or st.is_pacman:
-            return self.run_home(gs, plan, caps)
-        return self.find_gap(gs, danger)
-
-    def carry_limit(self, gs, near, n_ghosts):
-        if near <= 6:
-            return 3
-        if n_ghosts == 0:
-            return 12            # nobody defending
-        limit = 4 if len(self.get_food(gs).as_list()) < 8 else 7
-        if self.get_score(gs) < 0:
-            limit += 2           # losing -> take more
-        return limit
-
-    def pick_food(self, gs, food, plan, danger, caps, carrying, active):
-        need = 2 + min(carrying, 6) // 3      # margin we want, more food on us = more careful
-        if self.stuck >= 4 and carrying <= 2:
-            need = 1 if self.stuck < 12 else 0
-        if self.stuck >= 20 and carrying == 0:
-            need = -BIG                        # nothing to lose
-        moves_left = gs.data.timeleft // 4
-        mate_target = self.team.targets.get(self.mate)
-
-        best, best_score, best_m = None, BIG, 0
-        for f in food:
-            if f not in plan:
-                continue
-            moves = plan[f][0]
-            m = self.margin(f, moves, danger, caps)
-            if m < need or moves + self.home_distance(f) >= moves_left - 2:
-                continue
-            # close + safe is good
-            score = moves - (4 if need == -BIG else 1.5) * min(m, 6)
-            if self.depth[f] > 0 and active:
-                score += self.depth[f]
-            if mate_target is not None and self.get_maze_distance(f, mate_target) <= 3:
-                score += 6                      # dont go to the same food as the mate
-            score += 0.05 * carrying * self.home_distance(f)
-            if score < best_score:
-                best, best_score, best_m = f, score, m
-        return best, best_m
-
-    def run_home(self, gs, plan, caps):
-        # closest safe border cell or capsule
-        goals = [(plan[g][0], g) for g in self.border + caps if g in plan and plan[g][1]]
-        if goals:
-            return plan[min(goals)[1]][1]
-        # no safe path. try again only with the ghosts we see (unseen ones might be wrong)
-        me = gs.get_agent_position(self.index)
-        seen = [o for o in self.opponents if gs.get_agent_position(o) is not None
-                and not gs.get_agent_state(o).is_pacman and gs.get_agent_state(o).scared_timer <= 1]
-        if not seen:
-            return self.step_towards(gs, min(self.border, key=lambda b: self.get_maze_distance(me, b)))
-        return self.alpha_beta_escape(gs, min(seen, key=lambda o: self.get_maze_distance(me, gs.get_agent_position(o))))
-
-    def alpha_beta_escape(self, gs, ghost, depth=2):
-
-        def evaluate(s):
-            pos = s.get_agent_position(self.index)
-            if pos == self.start:
-                return -1000                          # eaten
-            if not s.get_agent_state(self.index).is_pacman:
-                return 500                            # home!
-            return (2 * self.get_maze_distance(pos, s.get_agent_position(ghost))
-                    - self.home_distance(pos) - 3 * self.depth[pos])
-
-        def max_value(s, d, alpha, beta):
-            if d == 0 or s.get_agent_position(self.index) == self.start or not s.get_agent_state(self.index).is_pacman:
-                return evaluate(s)
-            v = -BIG
-            for a in s.get_legal_actions(self.index):
-                v = max(v, min_value(s.generate_successor(self.index, a), d, alpha, beta))
-                if v >= beta:
-                    return v    #beta cut
-                alpha = max(alpha, v)
-            return v
-
-        def min_value(s, d, alpha, beta):
-            if s.get_agent_position(self.index) == self.start or not s.get_agent_state(self.index).is_pacman:
-                return evaluate(s)
-            v = BIG
-            for a in s.get_legal_actions(ghost):
-                v = min(v, max_value(s.generate_successor(ghost, a), d - 1, alpha, beta))
-                if v <= alpha:
-                    return v    # alpha cut
-                beta = min(beta, v)
-            return v
-
-        best, best_v = None, -BIG
+    def alpha_beta(self, gs, ghost):
+        best_action = Directions.STOP
+        best_value = -INF
         for a in gs.get_legal_actions(self.index):
-            v = min_value(gs.generate_successor(self.index, a), depth, best_v, BIG)
-            if v > best_v:
-                best, best_v = a, v
-        return best
+            next_state = gs.generate_successor(self.index, a)
+            v = self.min_value(next_state, ghost, DEPTH, best_value, INF)
+            if v > best_value:
+                best_value = v
+                best_action = a
+        return best_action
 
-    def find_gap(self, gs, danger):
-        # home and nothing safe to eat: go to the border cell where the ghosts are far
-        me = gs.get_agent_position(self.index)
-        side = 1 if self.red else -1
-        best = max(self.border, key=lambda b: 2 * min(danger[(b[0] + side, b[1])], 15)
-                   - self.get_maze_distance(me, b))
-        return self.step_towards(gs, best, stay_home=True)
+    def max_value(self, s, ghost, depth, alpha, beta):
+        if depth == 0 or self.game_over_for_us(s):
+            return self.evaluate(s, ghost)
+        v = -INF
+        for a in s.get_legal_actions(self.index):
+            v = max(v, self.min_value(s.generate_successor(self.index, a), ghost, depth, alpha, beta))
+            if v >= beta:
+                return v       # beta cut
+            alpha = max(alpha, v)
+        return v
+
+    def min_value(self, s, ghost, depth, alpha, beta):
+        if self.game_over_for_us(s):
+            return self.evaluate(s, ghost)
+        v = INF
+        for a in s.get_legal_actions(ghost):
+            v = min(v, self.max_value(s.generate_successor(ghost, a), ghost, depth - 1, alpha, beta))
+            if v <= alpha:
+                return v       # alpha cut
+            beta = min(beta, v)
+        return v
+
+    def game_over_for_us(self, s):
+        # eaten (back at start) or safe at home -> no need to look further
+        if s.get_agent_position(self.index) == self.start:
+            return True
+        if not s.get_agent_state(self.index).is_pacman:
+            return True
+        return False
+
+    def evaluate(self, s, ghost):
+        """Eval function: how good is state s for us"""
+        pos = s.get_agent_position(self.index)
+        if pos == self.start:
+            return -1000                      # eaten :(
+        carrying = s.get_agent_state(self.index).num_carrying
+        value = 100 * self.get_score(s)       # food already at home
+        value += 10 * carrying                # food we have with us
+
+        # far from the ghost is good (but more than 5 doesnt matter)
+        d_ghost = self.get_maze_distance(pos, s.get_agent_position(ghost))
+        if d_ghost <= 1:
+            value -= 500                      # he eats us next move
+        value += 2 * min(d_ghost, 5)
+
+        # with food -> want to be close to home, without -> close to food
+        if carrying > 0:
+            value -= self.home_distance(pos)
+        else:
+            closest = INF
+            for f in self.get_food(s).as_list():
+                closest = min(closest, self.get_maze_distance(pos, f))
+            if closest < INF:
+                value -= closest
+        return value
 
 
-class DefensiveAgent(OffensiveAgent):
+class DefensiveAgent(BaseAgent):
+    # stays in our side and catches invaders
+
+    def register_initial_state(self, gs):
+        BaseAgent.register_initial_state(self, gs)
+        self.last_eaten = None      # cell where they ate our food (we dont see them but we know they are there)
 
     def decide(self, gs):
-        st = gs.get_agent_state(self.index)
         me = gs.get_agent_position(self.index)
-        t = self.team
-        invaders = self.invaders(gs)
-        if invaders:
-            if st.is_pacman:
-                return self.attack(gs, go_home=True)    # we were attacking -> back home
-            return self.defend(gs, invaders)
+        scared = gs.get_agent_state(self.index).scared_timer > 0
 
-        if self.should_raid(gs):
-            return self.attack(gs)
-        if st.is_pacman:
-            return self.attack(gs, go_home=True)
-        t.targets.pop(self.index, None)
+        # did they eat something since our last turn? compare food with the previous observation
+        prev = self.get_previous_observation()
+        if prev is not None:
+            now = self.get_food_you_are_defending(gs).as_list()
+            for f in self.get_food_you_are_defending(prev).as_list():
+                if f not in now:
+                    self.last_eaten = f
 
-        # they just ate something -> go there
-        if t.last_eaten and t.turn - t.last_eaten[1] <= 10 and self.get_maze_distance(me, t.last_eaten[0]) > 1:
-            return self.step_towards(gs, t.last_eaten[0], stay_home=True)
-        return self.patrol(gs)
+        # invaders we can see -> go for the closest one
+        target = None
+        best = INF
+        for o in self.visible_rivals(gs, pacman=True):
+            pos = gs.get_agent_position(o)
+            d = self.get_maze_distance(me, pos)
+            if d < best:
+                best = d
+                target = pos
 
-    def should_raid(self, gs):
-        # nobody crossed in 100 turns -> they only defend, so we also attack (to not tie)
-        t = self.team
-        return (t.turn >= 100 and t.turn - t.last_invader_turn >= 100
-                and self.get_score(gs) <= 0 and gs.data.timeleft // 4 >= 30)
+        if target is not None:
+            self.last_eaten = None
+            if scared:
+                return self.keep_distance(gs, target, 2)    # he can eat us -> follow from 2 cells
+            action = self.bfs(me, [target], stay_home=True)
+        elif self.last_eaten is not None:
+            # we dont see him, but we know where he ate
+            if me == self.last_eaten:
+                self.last_eaten = None
+            action = self.bfs(me, [self.last_eaten], stay_home=True)
+        else:
+            # nobody: wait at the border cell closest to our food
+            action = self.bfs(me, [self.patrol_cell(gs)], stay_home=True)
 
-    def patrol(self, gs):
-        # wait at the border cell close to the rival that is closest to come in, and close to our food
-        me = gs.get_agent_position(self.index)
-        food = self.get_food_you_are_defending(gs).as_list()
-        rival = min((self.estimate(gs, o)[0] for o in self.opponents), key=self.home_distance)
-
-        def value(b):
-            v = self.get_maze_distance(b, rival)
-            if food:
-                v += 0.3 * min(self.get_maze_distance(b, f) for f in food)
-            return v
-
-        target = min(self.border, key=value)
-        if me == target:
+        if action is None:
             return Directions.STOP
-        return self.step_towards(gs, target, stay_home=True)
+        return action
+
+    def patrol_cell(self, gs):
+        food = self.get_food_you_are_defending(gs).as_list()
+        best_cell = self.border[0]
+        best_d = INF
+        for b in self.border:
+            for f in food:
+                d = self.get_maze_distance(b, f)
+                if d < best_d:
+                    best_d = d
+                    best_cell = b
+        return best_cell
+
+    def keep_distance(self, gs, target, k):
+        # when we are scared: stay at distance k of the invader (not closer)
+        me = gs.get_agent_position(self.index)
+        best_action = Directions.STOP
+        best_diff = INF
+        for a in gs.get_legal_actions(self.index):
+            if a == Directions.STOP:
+                nxt = me
+            else:
+                nxt = self.result(me, a)
+            if not self.on_my_side(nxt):
+                continue
+            d = self.get_maze_distance(nxt, target)
+            diff = abs(d - k)
+            if d < k:
+                diff += 100      # too close is very bad
+            if diff < best_diff:
+                best_diff = diff
+                best_action = a
+        return best_action
