@@ -10,7 +10,7 @@
 
 **Team members:**
 
-* Student 1's 262335 - Livia Fernandez - Livia.fernandez01@estudiant.upf.edu - LiviaFernandez
+* Student 1's 252336 - Livia Fernandez - Livia.fernandez01@estudiant.upf.edu - LiviaFernandez
 * Student 2's Student number - Full Name - Student email - Student Github id
 * Student 3's Student number - Full Name - Student email - Student Github id
 

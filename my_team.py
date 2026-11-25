@@ -137,7 +137,7 @@ class BaseAgent(CaptureAgent):
 
 class OffensiveAgent(BaseAgent):
     # goes to eat their food
-
+    
     def decide(self, gs):
         me = gs.get_agent_position(self.index)
         my_state = gs.get_agent_state(self.index)
@@ -177,7 +177,6 @@ class OffensiveAgent(BaseAgent):
         return action
 
     #  alpha-beta, MAX = us, MIN = the ghost
-
     def alpha_beta(self, gs, ghost):
         best_action = Directions.STOP
         best_value = -INF
