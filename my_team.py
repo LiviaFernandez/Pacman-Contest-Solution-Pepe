@@ -6,39 +6,6 @@
 # John DeNero (denero@cs.berkeley.edu) and Dan Klein (klein@cs.berkeley.edu).
 # For more info, see http://inst.eecs.berkeley.edu/~cs188/sp09/pacman.html
 
-"""
-Equipo para Pacman Capture the Flag.
-
-Ideas principales
------------------
-1. Precalculo (register_initial_state):
-   - Distancias de laberinto: las del propio CaptureAgent (get_maze_distance),
-     y otro Distancer del proyecto sobre una copia del mapa con el campo rival
-     tapado, para que el defensor mida distancias sin cruzar.
-   - Casillas frontera de nuestro campo (por donde se vuelve a casa).
-   - Analisis de callejones sin salida: profundidad y casilla de salida.
-
-2. Seguimiento de rivales (inferencia exacta con util.Counter, compartida por
-   el equipo): creencia P(posicion) para cada rival, actualizada con su
-   movimiento, con la lectura de distancia ruidosa (get_distance_prob), con el
-   hecho de "no lo vemos" (esta a > 5 de los nuestros), con su bando
-   (is_pacman) y con la comida que desaparece de nuestro campo.
-
-3. Atacante: BFS "segura en el tiempo". Una casilla del campo rival a la que
-   llegamos en t pasos es peligrosa si un fantasma no asustado puede llegar en
-   <= t pasos. Solo elige comida con margen suficiente sobre los fantasmas (en
-   callejones, margen para salir antes de que tapen la salida). Vuelve a casa
-   segun lo que lleva, el peligro y el tiempo restante; usa capsulas para
-   escapar y, si lleva tiempo bloqueado sin nada encima, asume mas riesgo.
-   Ayuda a defender (pinza) cuando un invasor lleva mucha comida.
-
-4. Defensor: no cruza al campo rival. Ante un invasor se coloca donde menos
-   comida le quede "segura" al invasor (control de zona) y lo persigue cuando
-   esta cerca; con dos defensores, uno persigue y el otro cierra la salida.
-   Si esta asustado mantiene distancia 2. Sin invasores vigila la frontera por
-   donde es mas probable que entren. Contra equipos que nunca atacan (y si no
-   vamos ganando) sale tambien a atacar para romper el empate.
-"""
 
 import os
 import random
@@ -49,10 +16,9 @@ from contest.capture_agents import CaptureAgent
 from contest.game import Directions, Actions, Configuration
 from contest.util import nearest_point
 
-INF = 10 ** 6
-SIGHT_RANGE = 5
-MIN_FOOD = 2
-UNSEEN_SLACK = 3      # holgura para fantasmas no vistos (estan a > 5 casillas)
+SIGHT_RANGE = 5 #maximum visibility range according to rules
+MIN_FOOD = 2 # according to rules it is over when all food but 2 is eaten
+UNSEEN_SLACK = 3      # margin of error for unseen ghots  
 _DEBUG = os.environ.get('PACMAN_DEBUG') == '1'   # solo para pruebas locales
 
 
@@ -66,7 +32,7 @@ def create_team(first_index, second_index, is_red,
 
 
 ##################################
-# Informacion compartida por equipo
+# info compartida por los dos agentes
 ##################################
 
 class TeamInfo:
@@ -79,7 +45,7 @@ class TeamInfo:
         self.last_eaten = None          # (pos, turno) de la ultima comida nuestra que se comio el rival
         self.turn = 0
         self.targets = {}               # indice agente -> casilla objetivo actual
-        self.invader_seen_turn = -INF   # ultimo turno con algun invasor
+        self.invader_seen_turn = -float('inf')   # ultimo turno con algun invasor
         self.helping = {}               # indice agente -> ultimo turno en que ayudo a defender
         self.last_pacman_turn = {}      # rival -> ultimo turno en que estuvo en nuestro campo
 
@@ -97,69 +63,67 @@ class BaseAgent(CaptureAgent):
         super().__init__(index, time_for_computing)
         self.start = None
 
-    # ------------------------------------------------------------------
-    # Inicializacion
-    # ------------------------------------------------------------------
+
     def register_initial_state(self, game_state):
-        # Calcula self.distancer (distancias de laberinto del proyecto)
+
         CaptureAgent.register_initial_state(self, game_state)
         self.start = game_state.get_agent_position(self.index)
 
-        team = _TEAMS.get(self.red)
+        team = _TEAMS.get(self.red) #shared memory
+
         if team is None or self.index in team.registered:
-            team = TeamInfo()            # partida nueva
+            team = TeamInfo()            #crea una partida nueva
             _TEAMS[self.red] = team
-        team.registered.add(self.index)
+
+        team.registered.add(self.index) #luego simplemente se añade
         self.team = team
 
-        if not team.ready:
+        if not team.ready: #analiza el mapa, una vez por equipo (con team.ready)
             self._precompute(game_state)
             team.ready = True
-        self.walls, self.cells, self.mid = team.walls, team.cells, team.mid
+        self.walls, self.cells, self.mid = team.walls, team.cells, team.mid #get info
         self.home_border, self.home_distancer = team.home_border, team.home_distancer
         self.depth, self.exit = team.depth, team.exit
 
         self.opponents = self.get_opponents(game_state)
         self.teammate = [i for i in self.get_team(game_state) if i != self.index][0]
-        for opp in self.opponents:
-            if opp not in team.beliefs:
-                b = util.Counter()
-                b[game_state.get_initial_agent_position(opp)] = 1.0
-                team.beliefs[opp] = b
         self.opp_start = {o: game_state.get_initial_agent_position(o) for o in self.opponents}
+        for opp in self.opponents:
+            # al empezar, cada rival esta seguro en su casilla de salida
+            team.beliefs.setdefault(opp, util.Counter({self.opp_start[opp]: 1.0}))
         self.initial_enemy_food = len(self.get_food(game_state).as_list())
+
         self.last_positions = []
         self.stuck = 0
         self.last_carrying = 0
         self.help_streak = 0
         self.help_cooldown = 0
 
+    #helper function: studies the map at the start of the game and saves the results in the team's shared memory
     def _precompute(self, gs):
         t = self.team
         walls = gs.get_walls()
         t.walls = walls
-        t.mid = walls.width / 2.0        # el motor usa x < ancho/2 para el campo rojo
-        t.cells = walls.as_list(False)
+        t.mid = walls.width / 2.0        # middle line of the grid 
+        t.cells = walls.as_list(False)  #open cells
 
-        # Distancias moviendose solo por nuestro campo: Distancer del proyecto
-        # sobre una copia del mapa con el campo rival convertido en pared.
+        # Distance inside our camp (defender diesn't leave)
         home_layout = gs.data.layout.deep_copy()
         for x in range(walls.width):
-            if (x < t.mid) != self.red:
+            if (x < t.mid) != self.red: #next cellis  from rival
                 for y in range(walls.height):
                     home_layout.walls[x][y] = True
         t.home_distancer = distance_calculator.Distancer(home_layout)
         t.home_distancer.get_maze_distances()
 
-        # Frontera propia: ultima columna de nuestro campo con paso al otro lado
-        red_x = (walls.width - 1) // 2      # ultima columna roja
-        blue_x = (walls.width + 1) // 2     # primera columna azul
+        red_x = (walls.width - 1) // 2      # last red colu
+        blue_x = (walls.width + 1) // 2     # first blue col
         bx, ox = (red_x, blue_x) if self.red else (blue_x, red_x)
         t.home_border = [(bx, y) for y in range(walls.height)
                          if not walls[bx][y] and not walls[ox][y]]
 
-        # Callejones sin salida: poda iterativa de casillas de grado <= 1
-        # (get_legal_neighbors incluye la propia casilla: se quita)
+        # no way out
+        # get_legal_neighbors has its own cell
         nbrs = {c: [n for n in Actions.get_legal_neighbors(c, walls) if n != c] for c in t.cells}
         deg = {c: len(nbrs[c]) for c in t.cells}
         removed = set()
@@ -198,13 +162,13 @@ class BaseAgent(CaptureAgent):
         t.depth, t.exit = depth, exit_
 
     # ------------------------------------------------------------------
-    # Distancias y campo
+    # Distances
     # ------------------------------------------------------------------
     def hdist(self, a, b):
-        """Distancia sin salir de nuestro campo (si no hay camino, la normal + penalizacion)."""
+        #Distance without leaving our camp, (si no hay camino, la normal + penalizacion)
         if self.on_home_side(a) and self.on_home_side(b):
             d = self.home_distancer.get_distance(a, b)
-            if d < INF:
+            if d < 10 ** 6: 
                 return d
         return self.get_maze_distance(a, b) + 50
 
@@ -339,8 +303,6 @@ class BaseAgent(CaptureAgent):
         self.last_positions = (self.last_positions + [game_state.get_agent_position(self.index)])[-12:]
         return action
 
-    def decide(self, gs):
-        raise NotImplementedError
 
     # ------------------------------------------------------------------
     # Piezas comunes
@@ -358,7 +320,7 @@ class BaseAgent(CaptureAgent):
 
     def danger_map(self, threats):
         """danger[c] = primer instante en que un fantasma no asustado puede estar en la casilla c."""
-        danger = {c: INF for c in self.cells}
+        danger = {c: float('inf') for c in self.cells}
         for pos, scared, seen in threats:
             slack = 0 if seen else UNSEEN_SLACK   # un fantasma no visto esta mal localizado
             for c in self.cells:
@@ -394,7 +356,7 @@ class BaseAgent(CaptureAgent):
         de cualquier fantasma. Si pos esta en un callejon, lo que cuenta es poder
         salir del callejon antes de que un fantasma llegue a su entrada."""
         if self.on_home_side(pos):
-            return INF
+            return float('inf')
         if self.depth[pos] > 0:
             m = danger[self.exit[pos]] - (t + self.depth[pos])
         else:
@@ -408,7 +370,7 @@ class BaseAgent(CaptureAgent):
     def evade(self, gs, threats):
         """Ultimo recurso: alejarse de los fantasmas, evitando callejones."""
         my_pos = gs.get_agent_position(self.index)
-        best, best_score = None, -INF
+        best, best_score = None, -float('inf')
         active = [p for p, s, _ in threats if s <= 1]
         for a in gs.get_legal_actions(self.index):
             nxt = nearest_point(Actions.get_successor(my_pos, a))
@@ -436,7 +398,7 @@ class BaseAgent(CaptureAgent):
     def step_towards(self, gs, target, avoid_enemy_side=False, keep_dist=None):
         """Accion que minimiza la distancia de laberinto a target."""
         my_pos = gs.get_agent_position(self.index)
-        best, best_score = [], INF
+        best, best_score = [], float('inf')
         for a in gs.get_legal_actions(self.index):
             nxt = nearest_point(Actions.get_successor(my_pos, a))
             if avoid_enemy_side and not self.on_home_side(nxt):
@@ -468,7 +430,7 @@ class BaseAgent(CaptureAgent):
             # Pinza: bloquear la via de escape del invasor por el lado opuesto al
             # companero que lo persigue (casilla a la que llego antes que el invasor).
             chaser = gs.get_agent_position(self.teammate)
-            best, best_d = None, INF
+            best, best_d = None, float('inf')
             for c in self.cells:
                 if not self.on_home_side(c):
                     continue
@@ -491,7 +453,7 @@ class BaseAgent(CaptureAgent):
         food_d = [(f, self.get_maze_distance(inv_pos, f)) for f in self.get_food_you_are_defending(gs).as_list()]
         cap_d = [(c, self.get_maze_distance(inv_pos, c)) for c in self.get_capsules_you_are_defending(gs)]
         border_d = [(b, self.get_maze_distance(inv_pos, b)) for b in self.home_border]
-        best, best_score = [], INF
+        best, best_score = [], float('inf')
         for a in gs.get_legal_actions(self.index):
             n = nearest_point(Actions.get_successor(my_pos, a))
             if not self.on_home_side(n):
@@ -599,11 +561,11 @@ class OffensiveAgent(BaseAgent):
 
         # Proximidad del peligro (fantasmas activos)
         active = [(p, s, seen) for p, s, seen in threats if s <= 3]
-        near_threat = min([self.get_maze_distance(my_pos, p) for p, s, seen in active if seen] or [INF])
+        near_threat = min([self.get_maze_distance(my_pos, p) for p, s, seen in active if seen] or [float('inf')])
 
         # Tiempo seguro para volver a casa
         home_opts = [(reach[b][0], b) for b in self.home_border if b in reach]
-        home_t, home_b = min(home_opts) if home_opts else (INF, None)
+        home_t, home_b = min(home_opts) if home_opts else (float('inf'), None)
 
         # Cuantas tenemos ya en casa + encima
         returned = sum(gs.get_agent_state(i).num_returned for i in self.get_team(gs))
@@ -622,13 +584,13 @@ class OffensiveAgent(BaseAgent):
                 go_home = True
 
         # --- Elegir comida ---
-        best_food, best_score, best_margin = None, INF, -INF
+        best_food, best_score, best_margin = None, float('inf'), -float('inf')
         # Si llevamos varios turnos sin objetivo, aceptamos algo de riesgo
         need = 2 + min(carrying, 6) // 3
         if self.stuck >= 4 and carrying <= 2:
             need = 1 if self.stuck < 12 else 0
             if carrying == 0 and self.stuck >= 20:
-                need = -INF     # sin nada que perder: arriesgar
+                need = -float('inf')     # sin nada que perder: arriesgar
         if not go_home:
             mate_target = team.targets.get(self.teammate)
             for f in food:
@@ -642,7 +604,7 @@ class OffensiveAgent(BaseAgent):
                 if t + self.home_dist(f) >= moves_left - 2:
                     continue
                 score = t - 1.5 * min(margin, 6)
-                if need == -INF:
+                if need == -float('inf'):
                     score = t - 4 * min(margin, 6)
                 if self.depth[f] > 0 and active:
                     score += self.depth[f]
@@ -657,15 +619,15 @@ class OffensiveAgent(BaseAgent):
             if active and near_threat <= 6:
                 for c in capsules:
                     if c in reach and reach[c][0] - 4 < best_score:
-                        best_food, best_score, best_margin = c, reach[c][0] - 4, INF
+                        best_food, best_score, best_margin = c, reach[c][0] - 4, float('inf')
 
             # Comer un fantasma asustado si esta muy a mano
             for p, s, seen in threats:
                 if seen and s > 2 and p in reach and reach[p][0] <= 2 and reach[p][0] < s:
-                    best_food, best_score, best_margin = p, -10, INF
+                    best_food, best_score, best_margin = p, -10, float('inf')
 
             # Si llevamos mucho y la comida esta mas lejos que casa, asegurar puntos
-            if best_food is not None and carrying >= 3 and home_t < INF and best_score > home_t + 4 and active:
+            if best_food is not None and carrying >= 3 and home_t < float('inf') and best_score > home_t + 4 and active:
                 go_home = True
 
             if best_food is None and (carrying > 0 or my_state.is_pacman):
@@ -721,7 +683,7 @@ class OffensiveAgent(BaseAgent):
     def probe_border(self, gs, danger):
         """Elegir punto de cruce: lejos de los fantasmas y cerca de mi."""
         my_pos = gs.get_agent_position(self.index)
-        best, best_score = None, -INF
+        best, best_score = None, -float('inf')
         for b in self.home_border:
             nb = [n for n in Actions.get_legal_neighbors(b, self.walls) if n != b and not self.on_home_side(n)]
             dg = min([danger[n] for n in nb] + [15])
@@ -750,7 +712,7 @@ class DefensiveAgent(OffensiveAgent):
                 return self.attack(gs, force_home=True)
             helpers = [self.index]
             mate_state = gs.get_agent_state(self.teammate)
-            if team.helping.get(self.teammate, -INF) >= team.turn - 2 and not mate_state.is_pacman:
+            if team.helping.get(self.teammate, -float('inf')) >= team.turn - 2 and not mate_state.is_pacman:
                 helpers.append(self.teammate)
             return self.defenders_plan(gs, helpers)
 
